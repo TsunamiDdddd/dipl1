@@ -50,12 +50,93 @@ SPI_HandleTypeDef hspi2;
 DMA_HandleTypeDef hdma_spi2_rx;
 DMA_HandleTypeDef hdma_spi2_tx;
 
-osThreadId defaultTaskHandle;
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .priority = (osPriority_t) osPriorityLow,
+  .stack_size = 1024 * 4
+};
+/* Definitions for tDSP_Core */
+osThreadId_t tDSP_CoreHandle;
+const osThreadAttr_t tDSP_Core_attributes = {
+  .name = "tDSP_Core",
+  .priority = (osPriority_t) osPriorityHigh,
+  .stack_size = 512 * 4
+};
+/* Definitions for tUartTx */
+osThreadId_t tUartTxHandle;
+const osThreadAttr_t tUartTx_attributes = {
+  .name = "tUartTx",
+  .priority = (osPriority_t) osPriorityNormal,
+  .stack_size = 256 * 4
+};
+/* Definitions for tCmd */
+osThreadId_t tCmdHandle;
+const osThreadAttr_t tCmd_attributes = {
+  .name = "tCmd",
+  .priority = (osPriority_t) osPriorityLow,
+  .stack_size = 128 * 4
+};
+/* Definitions for qCalibOut */
+osMessageQueueId_t qCalibOutHandle;
+const osMessageQueueAttr_t qCalibOut_attributes = {
+  .name = "qCalibOut"
+};
+/* Definitions for mtxCalib */
+osMutexId_t mtxCalibHandle;
+const osMutexAttr_t mtxCalib_attributes = {
+  .name = "mtxCalib"
+};
+/* Definitions for semUartDma */
+osSemaphoreId_t semUartDmaHandle;
+const osSemaphoreAttr_t semUartDma_attributes = {
+  .name = "semUartDma"
+};
+
+
+
 /* USER CODE BEGIN PV */
+
+
+
 char test[20] = "Hello UART!\r\n";
 #define DATA_SIZE 16
 uint8_t spi_rx_buf[DATA_SIZE];
+/* Буферы SPI DMA (выровнены для кэша, если есть) */
+#define SPI_DMA_BUF_SIZE  256
+__ALIGN_BEGIN static uint8_t spi_rx_buf[SPI_DMA_BUF_SIZE] __ALIGN_END;
+static uint8_t spi_tx_dummy = 0x00;  // Dummy-байт для генерации SCK
+
+/* Состояние фильтра SINC3 */
+typedef struct {
+    int32_t i1, i2, i3;  // Интеграторы
+    int32_t d1, d2, d3;  // Комб-фильтр
+    uint16_t cnt;
+} SINC3_t;
+static SINC3_t sinc3;
+
+/* Калибровка */
+typedef struct {
+    float offset;
+    float gain;
+    uint8_t calibrated;
+} Calib_t;
+static Calib_t calib = {.offset = 0, .gain = 1.0f, .calibrated = 0};
+
+/* Флаги для задач */
+#define FLAG_DMA_HALF  0x01UL
+#define FLAG_DMA_FULL  0x02UL
+#define FLAG_DATA_READY 0x04UL
+
+
+
+
 /* USER CODE END PV */
+
+
+
+
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -63,7 +144,10 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_SPI2_Init(void);
-void StartDefaultTask(void const * argument);
+void StartDefaultTask(void *argument);
+void StartTDSP_Core(void *argument);
+void StartTUartTx(void *argument);
+void StartTCmd(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -106,38 +190,81 @@ int main(void)
   MX_DMA_Init();
   MX_LPUART1_UART_Init();
   MX_SPI2_Init();
+
+
+
   /* USER CODE BEGIN 2 */
 
+
+  // Инициализация SINC3
+  memset(&sinc3, 0, sizeof(sinc3));
+
+  // Запуск SPI DMA (непрерывный приём + генерация SCK)
+  HAL_SPI_Transmit_DMA(&hspi2, &spi_tx_dummy, 1);  // Circular TX для SCK
+  HAL_SPI_Receive_DMA(&hspi2, spi_rx_buf, SPI_DMA_BUF_SIZE);  // Circular RX
+
+  // Разблокировать семафор UART DMA (первая передача может идти сразу)
+  osSemaphoreRelease(semUartDmaHandle);
+
+
   /* USER CODE END 2 */
+
+
+
+
+  /* Init scheduler */
+  osKernelInitialize();
+  /* Create the mutex(es) */
+  /* creation of mtxCalib */
+  mtxCalibHandle = osMutexNew(&mtxCalib_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   /* USER CODE END RTOS_MUTEX */
 
+  /* Create the semaphores(s) */
+  /* creation of semUartDma */
+  semUartDmaHandle = osSemaphoreNew(1, 0, &semUartDma_attributes);
+
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
   osSemaphoreId uartTxDoneSem;
   osSemaphoreDef(uartTxDone);
-  uartTxDoneSem = osSemaphoreCreate(osSemaphore(uartTxDone), 1);
-  osSemaphoreWait(uartTxDoneSem, osWaitForever); // разрешить первый запуск
+
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
   /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
 
+  /* Create the queue(s) */
+  /* creation of qCalibOut */
+  qCalibOutHandle = osMessageQueueNew (8, sizeof(float), &qCalibOut_attributes);
+
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityIdle, 0, 1024);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* creation of tDSP_Core */
+  tDSP_CoreHandle = osThreadNew(StartTDSP_Core, NULL, &tDSP_Core_attributes);
+
+  /* creation of tUartTx */
+  tUartTxHandle = osThreadNew(StartTUartTx, NULL, &tUartTx_attributes);
+
+  /* creation of tCmd */
+  tCmdHandle = osThreadNew(StartTCmd, NULL, &tCmd_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
 
   /* Start scheduler */
   osKernelStart();
@@ -175,11 +302,11 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV2;
-  RCC_OscInitStruct.PLL.PLLN = 8;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV6;
+  RCC_OscInitStruct.PLL.PLLN = 64;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV4;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -194,7 +321,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -275,7 +402,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -304,10 +431,10 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 10, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
   /* DMA1_Channel2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 10, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
   /* DMA1_Channel3_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 5, 0);
@@ -360,7 +487,7 @@ static void MX_GPIO_Init(void)
   * @retval None
   */
 /* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void const * argument)
+void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
@@ -387,6 +514,60 @@ void StartDefaultTask(void const * argument)
         osDelay(500); // 500 мс, чтобы не засорять терминал
     }
   /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartTDSP_Core */
+/**
+* @brief Function implementing the tDSP_Core thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTDSP_Core */
+void StartTDSP_Core(void *argument)
+{
+  /* USER CODE BEGIN StartTDSP_Core */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartTDSP_Core */
+}
+
+/* USER CODE BEGIN Header_StartTUartTx */
+/**
+* @brief Function implementing the tUartTx thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTUartTx */
+void StartTUartTx(void *argument)
+{
+  /* USER CODE BEGIN StartTUartTx */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartTUartTx */
+}
+
+/* USER CODE BEGIN Header_StartTCmd */
+/**
+* @brief Function implementing the tCmd thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTCmd */
+void StartTCmd(void *argument)
+{
+  /* USER CODE BEGIN StartTCmd */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartTCmd */
 }
 
 /**
